@@ -10,13 +10,13 @@ permissions:
 
 jobs:
   build-android:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: 1. 下載儲存庫程式碼
         uses: actions/checkout@v4
 
       - name: 2. 安裝 Java 17 環境
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '17'
@@ -26,46 +26,57 @@ jobs:
         with:
           channel: 'stable'
 
-      - name: 4. 自動生成 Android 專案結構、加入套件與網絡權限
+      - name: 4. 自動尋找 Dart 檔案、生成 Android 專案並編譯
         run: |
-          # 兼容兩種擺放位置：不論你把檔案命名為 lib/main.dart 或 hk_weather_radar_main.dart 都能自動識別
-          if [ -f "lib/main.dart" ]; then
-            cp lib/main.dart /tmp/user_main.dart
-          elif [ -f "hk_weather_radar_main.dart" ]; then
-            cp hk_weather_radar_main.dart /tmp/user_main.dart
-          elif [ -f "main.dart" ]; then
-            cp main.dart /tmp/user_main.dart
-          else
-            echo "找不到 main.dart 或 hk_weather_radar_main.dart，請確認已上傳程式碼檔案！"
+          echo "=== 檢查儲存庫內的檔案 ==="
+          ls -la
+
+          # 自動搜尋儲存庫內任何名稱的 .dart 檔案
+          DART_FILE=$(find . -maxdepth 3 -name "*.dart" | head -n 1)
+
+          if [ -z "$DART_FILE" ]; then
+            echo "❌ 錯誤：在儲存庫中找不到任何 .dart 程式碼檔案！"
+            echo "請先在儲存庫新增 lib/main.dart 或上傳 hk_weather_radar_main.dart。"
             exit 1
           fi
 
-          # 建立標準 Flutter Android 專案結構
+          echo "✅ 找到程式碼檔案：$DART_FILE"
+          cp "$DART_FILE" /tmp/user_main.dart
+
+          # 在獨立乾淨目錄建立合法的 Flutter Android 專案 (避免被含有連字號 '-' 的儲存庫名稱影響)
+          mkdir -p /tmp/hk_app
+          cd /tmp/hk_app
           flutter create --platforms=android --org hk.weather.radar --project-name hk_weather_radar .
+
+          # 覆蓋主程式
           cp /tmp/user_main.dart lib/main.dart
 
-          # 自動安裝氣象雷達與圖表所需套件
-          flutter pub add http flutter_map latlong2 fl_chart
+          # 安裝氣象雷達、圖表與本機設定儲存套件 (shared_preferences)
+          flutter pub add http flutter_map latlong2 fl_chart shared_preferences
 
-          # 自動在 AndroidManifest.xml 補上 INTERNET 網絡權限 (避免實機安裝後無法連線 API)
+          # 自動在 AndroidManifest.xml 補上 INTERNET 網絡權限
           if ! grep -q "android.permission.INTERNET" android/app/src/main/AndroidManifest.xml; then
             sed -i '/<application/i \    <uses-permission android:name="android.permission.INTERNET"/>' android/app/src/main/AndroidManifest.xml
           fi
 
-      - name: 5. 編譯 Android Release APK
-        run: flutter build apk --release
+          # 開始編譯 Release APK
+          flutter build apk --release
 
-      - name: 6. 上傳 APK 至 Actions Artifacts 備份
+          # 將編譯好的 APK 複製回 GitHub 工作目錄
+          mkdir -p "$GITHUB_WORKSPACE/output_apk"
+          cp build/app/outputs/flutter-apk/app-release.apk "$GITHUB_WORKSPACE/output_apk/hk-weather-radar.apk"
+
+      - name: 5. 上傳 APK 至 Actions Artifacts 備份
         uses: actions/upload-artifact@v4
         with:
           name: hk-weather-radar-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
+          path: output_apk/hk-weather-radar.apk
 
-      - name: 7. 自動發佈至 GitHub Releases (手機可直接點擊下載 .apk，免解壓 ZIP)
+      - name: 6. 自動發佈至 GitHub Releases (手機可直接點擊下載 .apk)
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v1.0.${{ github.run_number }}
           name: "香港及亞太氣象雷達 App v1.0.${{ github.run_number }}"
-          body: "📱 **手機直接安裝說明**：請點擊下方 Assets 區塊中的 `app-release.apk` 下載並安裝至 Android 手機。"
-          files: build/app/outputs/flutter-apk/app-release.apk
+          body: "📱 **手機直接安裝說明**：請點擊下方 Assets 區塊中的 `hk-weather-radar.apk` 下載並安裝至 Android 手機。"
+          files: output_apk/hk-weather-radar.apk
 
