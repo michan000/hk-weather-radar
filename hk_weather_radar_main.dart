@@ -5,17 +5,16 @@
 // 📦 1. 所需套件 (`pubspec.yaml` 或由 GitHub Actions `build.yml` 自動安裝)：
 //   flutter pub add http flutter_map latlong2 fl_chart shared_preferences
 //
-// 🌟 2. 本次重大更新重點：
-//   - 修正底圖 (Basemap) 開不了的問題：移除會導致新版 flutter_map 報錯的 {s}/{r} 參數，
-//     內建 8 款底圖切換（含免 Key 的香港政府 CSDI 官方中英文街道地圖、OSM 標準圖、
-//     Esri 全球衛星圖、Carto 直連深淺色圖，以及支援輸入 API Key 的 MapTiler / Mapbox / Stadia）。
-//   - 新增「完整設定與 API Key 控制中心」(支援本機自動記憶 SharedPreferences)：
-//     可隨時輸入底圖 API Key 與氣象/雷達 API Key (OpenWeatherMap、Rainbow.ai、Tomorrow.io)，
-//     自由切換亞太預報模型 (自動最佳、日本氣象廳 JMA、歐洲 ECMWF、中國氣象局 CMA、美國 GFS)、
-//     雷達色階、播放速度、透明度、溫度與風速單位 (°C/°F、km/h、m/s、節)。
-//   - 參考兩款 Google Play 標竿天氣雷達 App 介面：
-//     加入地圖右上角懸浮控制按鈕（一鍵換底圖、一鍵換氣象圖層、全螢幕雷達展開、18區氣溫標記開關）、
-//     頂部香港分區及亞太城市快速切換列、以及 6 格即時專業環境指標網格（體感溫度、UV、風向風速、氣壓、降水、濕度）。
+// 🌟 2. 本次更新與錯誤修復重點：
+//   - 修復 `type 'String' is not a subtype of type 'List<dynamic>?' in type cast` 錯誤：
+//     香港天文台 HKO Open Data API (`rhrread`) 在沒有生效警告或無紫外線數據時，
+//     `warningMessage` 與 `uvindex` 等欄位會回傳空字串 `""` 而非 `List` 或 `Map`。
+//     現已全面改為型別安全解析 (`_asList` / `_asMap` / `_asDouble` / `_asInt`)，
+//     並為所有 API 加入獨立容錯保護，確保任何單一欄位異常都不會中斷畫面！
+//   - 修正底圖 (Basemap) 開不了的問題：內建 8 款底圖切換（含免 Key 的香港政府 CSDI
+//     官方中英文街道地圖、OSM 標準圖、Esri 全球衛星圖、Carto 直連深淺色圖，以及支援
+//     輸入 API Key 的 MapTiler / Mapbox / Stadia）。
+//   - 完整設定與 API Key 控制中心 (支援本機自動記憶 SharedPreferences)。
 // ============================================================================
 
 import 'dart:async';
@@ -29,6 +28,46 @@ import 'package:shared_preferences/shared_preferences.dart';
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const HKWeatherRadarApp());
+}
+
+// ----------------------------------------------------------------------------
+// JSON 型別安全轉換輔助函式 (徹底防止 HKO API 回傳 "" 空字串時發生 Type Cast Error)
+// ----------------------------------------------------------------------------
+
+Map<String, dynamic> _asMap(dynamic value) {
+  if (value is Map<String, dynamic>) return value;
+  if (value is Map) return Map<String, dynamic>.from(value);
+  return <String, dynamic>{};
+}
+
+List<dynamic> _asList(dynamic value) {
+  if (value is List) return value;
+  return <dynamic>[];
+}
+
+List<String> _asStringList(dynamic value) {
+  if (value is List) {
+    return value
+        .map((e) => e?.toString().trim() ?? '')
+        .where((s) => s.isNotEmpty)
+        .toList();
+  }
+  if (value is String && value.trim().isNotEmpty) {
+    return [value.trim()];
+  }
+  return <String>[];
+}
+
+double? _asDouble(dynamic value) {
+  if (value is num) return value.toDouble();
+  if (value is String) return double.tryParse(value);
+  return null;
+}
+
+int? _asInt(dynamic value) {
+  if (value is num) return value.toInt();
+  if (value is String) return int.tryParse(value);
+  return null;
 }
 
 class HKWeatherRadarApp extends StatelessWidget {
@@ -260,7 +299,6 @@ class AppSettings {
         // Esri World Imagery 全球衛星實景圖 (免 Key)
         return 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
       case BasemapProvider.cartoDark:
-        // 直連 a.basemaps 避免 {s} 與 {r} 失敗
         return 'https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png';
       case BasemapProvider.cartoLight:
         return 'https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png';
@@ -422,44 +460,40 @@ class WeatherRepository {
   /// 1. 取得 RainViewer 雷達與紅外線衛星雲圖時間軸
   Future<Map<String, dynamic>> fetchRainViewerFrames() async {
     final uri = Uri.parse('https://api.rainviewer.com/public/weather-maps.json');
-    final response = await http.get(uri);
+    final response = await http.get(uri).timeout(const Duration(seconds: 12));
     if (response.statusCode != 200) {
       throw Exception('無法載入 RainViewer 雷達索引 (${response.statusCode})');
     }
-    final data = jsonDecode(response.body) as Map<String, dynamic>;
-    final String host = data['host'] ?? 'https://tilecache.rainviewer.com';
+    final data = _asMap(jsonDecode(response.body));
+    final String host = data['host']?.toString() ?? 'https://tilecache.rainviewer.com';
 
     final List<RadarFrame> radarFrames = [];
-    final radar = data['radar'] as Map<String, dynamic>?;
-    if (radar != null) {
-      final past = radar['past'] as List<dynamic>? ?? [];
-      final nowcast = radar['nowcast'] as List<dynamic>? ?? [];
-      for (final item in past) {
-        radarFrames.add(RadarFrame(
-          time: item['time'] as int,
-          path: item['path'] as String,
-          isForecast: false,
-        ));
+    final radar = _asMap(data['radar']);
+    for (final raw in _asList(radar['past'])) {
+      final item = _asMap(raw);
+      final time = _asInt(item['time']);
+      final path = item['path']?.toString() ?? '';
+      if (time != null && path.isNotEmpty) {
+        radarFrames.add(RadarFrame(time: time, path: path, isForecast: false));
       }
-      for (final item in nowcast) {
-        radarFrames.add(RadarFrame(
-          time: item['time'] as int,
-          path: item['path'] as String,
-          isForecast: true,
-        ));
+    }
+    for (final raw in _asList(radar['nowcast'])) {
+      final item = _asMap(raw);
+      final time = _asInt(item['time']);
+      final path = item['path']?.toString() ?? '';
+      if (time != null && path.isNotEmpty) {
+        radarFrames.add(RadarFrame(time: time, path: path, isForecast: true));
       }
     }
 
     final List<RadarFrame> satelliteFrames = [];
-    final satellite = data['satellite'] as Map<String, dynamic>?;
-    if (satellite != null) {
-      final infrared = satellite['infrared'] as List<dynamic>? ?? [];
-      for (final item in infrared) {
-        satelliteFrames.add(RadarFrame(
-          time: item['time'] as int,
-          path: item['path'] as String,
-          isForecast: false,
-        ));
+    final satellite = _asMap(data['satellite']);
+    for (final raw in _asList(satellite['infrared'])) {
+      final item = _asMap(raw);
+      final time = _asInt(item['time']);
+      final path = item['path']?.toString() ?? '';
+      if (time != null && path.isNotEmpty) {
+        satelliteFrames.add(RadarFrame(time: time, path: path, isForecast: false));
       }
     }
 
@@ -475,11 +509,11 @@ class WeatherRepository {
     final uri = Uri.parse(
       'https://data.weather.gov.hk/weatherAPI/opendata/weather.php?dataType=rhrread&lang=tc',
     );
-    final response = await http.get(uri);
+    final response = await http.get(uri).timeout(const Duration(seconds: 12));
     if (response.statusCode != 200) {
       throw Exception('無法載入香港天文台實時天氣');
     }
-    return jsonDecode(response.body) as Map<String, dynamic>;
+    return _asMap(jsonDecode(response.body));
   }
 
   /// 3. 取得香港天文台 (HKO) 9 天預報
@@ -487,22 +521,25 @@ class WeatherRepository {
     final uri = Uri.parse(
       'https://data.weather.gov.hk/weatherAPI/opendata/weather.php?dataType=fnd&lang=tc',
     );
-    final response = await http.get(uri);
+    final response = await http.get(uri).timeout(const Duration(seconds: 12));
     if (response.statusCode != 200) {
       throw Exception('無法載入香港天文台 9 天預報');
     }
-    final data = jsonDecode(response.body) as Map<String, dynamic>;
-    final list = data['weatherForecast'] as List<dynamic>? ?? [];
-    return list.map((item) {
+    final data = _asMap(jsonDecode(response.body));
+    final list = _asList(data['weatherForecast']);
+    return list.map((raw) {
+      final item = _asMap(raw);
       final rawDate = item['forecastDate']?.toString() ?? '';
       final formattedDate = rawDate.length == 8
           ? '${rawDate.substring(4, 6)}/${rawDate.substring(6, 8)}'
           : rawDate;
+      final minMap = _asMap(item['forecastMintemp']);
+      final maxMap = _asMap(item['forecastMaxtemp']);
       return DailyForecastItem(
         date: formattedDate,
         week: item['week']?.toString() ?? '',
-        minTemp: (item['forecastMintemp']?['value'] as num?)?.toDouble() ?? 0,
-        maxTemp: (item['forecastMaxtemp']?['value'] as num?)?.toDouble() ?? 0,
+        minTemp: _asDouble(minMap['value']) ?? 0.0,
+        maxTemp: _asDouble(maxMap['value']) ?? 0.0,
         forecastWeather: item['forecastWeather']?.toString() ?? '',
         psr: item['PSR']?.toString() ?? '中',
       );
@@ -528,11 +565,11 @@ class WeatherRepository {
       '&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max'
       '&forecast_days=9&timezone=auto$modelQuery',
     );
-    final response = await http.get(uri);
+    final response = await http.get(uri).timeout(const Duration(seconds: 12));
     if (response.statusCode != 200) {
       throw Exception('Open-Meteo 預報載入失敗 (${response.statusCode})');
     }
-    return jsonDecode(response.body) as Map<String, dynamic>;
+    return _asMap(jsonDecode(response.body));
   }
 
   /// 5. 若使用者輸入了 OpenWeatherMap API Key 並指定使用 OWM 預報
@@ -541,14 +578,18 @@ class WeatherRepository {
     String apiKey,
   ) async {
     if (apiKey.isEmpty) return null;
-    final uri = Uri.parse(
-      'https://api.openweathermap.org/data/2.5/weather'
-      '?lat=${location.latitude}&lon=${location.longitude}'
-      '&appid=$apiKey&units=metric&lang=zh_tw',
-    );
-    final response = await http.get(uri);
-    if (response.statusCode != 200) return null;
-    return jsonDecode(response.body) as Map<String, dynamic>;
+    try {
+      final uri = Uri.parse(
+        'https://api.openweathermap.org/data/2.5/weather'
+        '?lat=${location.latitude}&lon=${location.longitude}'
+        '&appid=$apiKey&units=metric&lang=zh_tw',
+      );
+      final response = await http.get(uri).timeout(const Duration(seconds: 10));
+      if (response.statusCode != 200) return null;
+      return _asMap(jsonDecode(response.body));
+    } catch (_) {
+      return null;
+    }
   }
 }
 
@@ -622,28 +663,20 @@ class _WeatherRadarHomeScreenState extends State<WeatherRadarHomeScreen> {
     });
 
     try {
-      // 並行請求：雷達時間軸 + Open-Meteo 亞太數據 + 香港天文台實時與9天預報
-      final rainViewerFuture = _repo.fetchRainViewerFrames();
-      final openMeteoFuture = _repo.fetchOpenMeteoData(
-        _selectedLocation.coords,
-        _settings.forecastSource,
-      );
-      final hkoCurrentFuture = _repoSafeHkoCurrent();
-      final hko9DayFuture = _repoSafeHko9Day();
-
+      // 各項資料來源均加上獨立安全保護，單一來源異常也不會影響整體 App 運作
       final results = await Future.wait([
-        rainViewerFuture,
-        openMeteoFuture,
-        hkoCurrentFuture,
-        hko9DayFuture,
+        _repoSafeRainViewer(),
+        _repoSafeOpenMeteo(),
+        _repoSafeHkoCurrent(),
+        _repoSafeHko9Day(),
       ]);
 
-      final rvData = results[0] as Map<String, dynamic>;
-      final omData = results[1] as Map<String, dynamic>;
+      final rvData = _asMap(results[0]);
+      final omData = _asMap(results[1]);
       final hkoCurrent = results[2] as Map<String, dynamic>?;
       final hko9Day = results[3] as List<DailyForecastItem>?;
 
-      // 解析香港 18 區氣象站溫度與警告
+      // 1. 型別安全解析香港 18 區氣象站溫度、濕度、UV 與警告 (修正 HKO 回傳空字串 "" 的問題)
       final List<HkoStationTemp> stations = [];
       double? hkoMainTemp;
       int? hkoMainHumidity;
@@ -651,10 +684,12 @@ class _WeatherRadarHomeScreenState extends State<WeatherRadarHomeScreen> {
       List<String> warnings = [];
 
       if (hkoCurrent != null) {
-        final tempList = hkoCurrent['temperature']?['data'] as List<dynamic>? ?? [];
-        for (final item in tempList) {
+        final tempSection = _asMap(hkoCurrent['temperature']);
+        final tempList = _asList(tempSection['data']);
+        for (final rawItem in tempList) {
+          final item = _asMap(rawItem);
           final place = item['place']?.toString() ?? '';
-          final val = (item['value'] as num?)?.toDouble();
+          final val = _asDouble(item['value']);
           if (val != null && kHkoStationCoords.containsKey(place)) {
             stations.add(HkoStationTemp(
               place: place,
@@ -666,49 +701,55 @@ class _WeatherRadarHomeScreenState extends State<WeatherRadarHomeScreen> {
             hkoMainTemp = val;
           }
         }
-        final rhList = hkoCurrent['humidity']?['data'] as List<dynamic>? ?? [];
+
+        final rhSection = _asMap(hkoCurrent['humidity']);
+        final rhList = _asList(rhSection['data']);
         if (rhList.isNotEmpty) {
-          hkoMainHumidity = (rhList.first['value'] as num?)?.toInt();
+          final firstRh = _asMap(rhList.first);
+          hkoMainHumidity = _asInt(firstRh['value']);
         }
-        final uvList = hkoCurrent['uvindex']?['data'] as List<dynamic>? ?? [];
+
+        // HKO 的 uvindex 在夜間或無數據時會回傳空字串 ""，使用 _asMap + _asList 可安全略過
+        final uvSection = _asMap(hkoCurrent['uvindex']);
+        final uvList = _asList(uvSection['data']);
         if (uvList.isNotEmpty) {
-          hkoUv = (uvList.first['value'] as num?)?.toDouble();
+          final firstUv = _asMap(uvList.first);
+          hkoUv = _asDouble(firstUv['value']);
         }
-        warnings = (hkoCurrent['warningMessage'] as List<dynamic>?)
-                ?.map((e) => e.toString())
-                .toList() ??
-            [];
+
+        // HKO 的 warningMessage 在無警告生效時會回傳空字串 ""，使用 _asStringList 可安全處理
+        warnings = _asStringList(hkoCurrent['warningMessage']);
       }
 
-      // 解析 Open-Meteo 當前與逐小時數據
-      final current = omData['current'] as Map<String, dynamic>? ?? {};
-      final hourly = omData['hourly'] as Map<String, dynamic>? ?? {};
-      final times = hourly['time'] as List<dynamic>? ?? [];
-      final hTemps = hourly['temperature_2m'] as List<dynamic>? ?? [];
-      final hProbs = hourly['precipitation_probability'] as List<dynamic>? ?? [];
-      final hWinds = hourly['wind_speed_10m'] as List<dynamic>? ?? [];
-      final hUvs = hourly['uv_index'] as List<dynamic>? ?? [];
+      // 2. 型別安全解析 Open-Meteo 當前與逐小時數據
+      final current = _asMap(omData['current']);
+      final hourly = _asMap(omData['hourly']);
+      final times = _asList(hourly['time']);
+      final hTemps = _asList(hourly['temperature_2m']);
+      final hProbs = _asList(hourly['precipitation_probability']);
+      final hWinds = _asList(hourly['wind_speed_10m']);
+      final hUvs = _asList(hourly['uv_index']);
 
       final List<HourlyPoint> hourlyList = [];
       final int count = times.length < 24 ? times.length : 24;
       for (int i = 0; i < count; i++) {
-        final rawTime = times[i].toString();
+        final rawTime = times[i]?.toString() ?? '';
         final hhmm = rawTime.contains('T') ? rawTime.split('T').last : rawTime;
         hourlyList.add(HourlyPoint(
           timeLabel: hhmm,
-          temp: (hTemps[i] as num?)?.toDouble() ?? 0.0,
-          precipProb: (hProbs.length > i ? (hProbs[i] as num?)?.toInt() : 0) ?? 0,
-          windSpeed: (hWinds.length > i ? (hWinds[i] as num?)?.toDouble() : 0.0) ?? 0.0,
+          temp: (hTemps.length > i ? _asDouble(hTemps[i]) : null) ?? 0.0,
+          precipProb: (hProbs.length > i ? _asInt(hProbs[i]) : null) ?? 0,
+          windSpeed: (hWinds.length > i ? _asDouble(hWinds[i]) : null) ?? 0.0,
         ));
       }
 
-      // 若選用 OpenWeatherMap API 且填有 Key，覆蓋當前指標
+      // 3. 若選用 OpenWeatherMap API 且填有 Key，覆蓋當前指標
       double? finalTemp = _selectedLocation.isHongKong && hkoMainTemp != null
           ? hkoMainTemp
-          : (current['temperature_2m'] as num?)?.toDouble();
+          : _asDouble(current['temperature_2m']);
       int? finalHumidity = _selectedLocation.isHongKong && hkoMainHumidity != null
           ? hkoMainHumidity
-          : (current['relative_humidity_2m'] as num?)?.toInt();
+          : _asInt(current['relative_humidity_2m']);
       String summary = _selectedLocation.isHongKong
           ? '香港天文台 HKO + ${_settings.forecastSource.label}'
           : _settings.forecastSource.label;
@@ -720,54 +761,59 @@ class _WeatherRadarHomeScreenState extends State<WeatherRadarHomeScreen> {
           _settings.openWeatherApiKey,
         );
         if (owm != null) {
-          finalTemp = (owm['main']?['temp'] as num?)?.toDouble() ?? finalTemp;
-          finalHumidity = (owm['main']?['humidity'] as num?)?.toInt() ?? finalHumidity;
+          final mainMap = _asMap(owm['main']);
+          finalTemp = _asDouble(mainMap['temp']) ?? finalTemp;
+          finalHumidity = _asInt(mainMap['humidity']) ?? finalHumidity;
           summary = 'OpenWeatherMap 實時 API';
         }
       }
 
       final metrics = CurrentMetrics(
         temp: finalTemp,
-        apparentTemp: (current['apparent_temperature'] as num?)?.toDouble(),
+        apparentTemp: _asDouble(current['apparent_temperature']) ?? finalTemp,
         humidity: finalHumidity,
-        windSpeedKmh: (current['wind_speed_10m'] as num?)?.toDouble(),
-        windDirectionDeg: (current['wind_direction_10m'] as num?)?.toInt(),
-        pressureHpa: (current['surface_pressure'] as num?)?.toDouble(),
-        uvIndex: hkoUv ?? (hUvs.isNotEmpty ? (hUvs.first as num?)?.toDouble() : 0.0),
-        precipMm: (current['precipitation'] as num?)?.toDouble() ?? 0.0,
+        windSpeedKmh: _asDouble(current['wind_speed_10m']),
+        windDirectionDeg: _asInt(current['wind_direction_10m']),
+        pressureHpa: _asDouble(current['surface_pressure']),
+        uvIndex: hkoUv ?? (hUvs.isNotEmpty ? _asDouble(hUvs.first) : 0.0),
+        precipMm: _asDouble(current['precipitation']) ?? 0.0,
         summaryText: summary,
       );
 
-      // 多日預報：若在香港則優先顯示香港天文台 9 天預報，否則使用 Open-Meteo 多日預報
+      // 4. 多日預報：若在香港則優先顯示香港天文台 9 天預報，否則使用 Open-Meteo 多日預報
       List<DailyForecastItem> dailyList = [];
       if (_selectedLocation.isHongKong && hko9Day != null && hko9Day.isNotEmpty) {
         dailyList = hko9Day;
       } else {
-        final daily = omData['daily'] as Map<String, dynamic>? ?? {};
-        final dDates = daily['time'] as List<dynamic>? ?? [];
-        final dMax = daily['temperature_2m_max'] as List<dynamic>? ?? [];
-        final dMin = daily['temperature_2m_min'] as List<dynamic>? ?? [];
-        final dProb = daily['precipitation_probability_max'] as List<dynamic>? ?? [];
+        final daily = _asMap(omData['daily']);
+        final dDates = _asList(daily['time']);
+        final dMax = _asList(daily['temperature_2m_max']);
+        final dMin = _asList(daily['temperature_2m_min']);
+        final dProb = _asList(daily['precipitation_probability_max']);
         for (int i = 0; i < dDates.length; i++) {
-          final raw = dDates[i].toString();
-          final shortDate = raw.length >= 10 ? raw.substring(5).replaceAll('-', '/') : raw;
-          final prob = (dProb.length > i ? (dProb[i] as num?)?.toInt() : 0) ?? 0;
+          final raw = dDates[i]?.toString() ?? '';
+          final shortDate =
+              raw.length >= 10 ? raw.substring(5).replaceAll('-', '/') : raw;
+          final prob = (dProb.length > i ? _asInt(dProb[i]) : null) ?? 0;
           dailyList.add(DailyForecastItem(
             date: shortDate,
             week: 'Day ${i + 1}',
-            minTemp: (dMin[i] as num?)?.toDouble() ?? 0,
-            maxTemp: (dMax[i] as num?)?.toDouble() ?? 0,
-            forecastWeather: prob >= 60 ? '有陣雨或雷雨' : (prob >= 30 ? '局部多雲有雨' : '大致天晴至多雲'),
+            minTemp: (dMin.length > i ? _asDouble(dMin[i]) : null) ?? 0.0,
+            maxTemp: (dMax.length > i ? _asDouble(dMax[i]) : null) ?? 0.0,
+            forecastWeather: prob >= 60
+                ? '有陣雨或雷雨'
+                : (prob >= 30 ? '局部多雲有雨' : '大致天晴至多雲'),
             psr: '$prob%',
           ));
         }
       }
 
-      final rFrames = rvData['radarFrames'] as List<RadarFrame>;
-      final sFrames = rvData['satelliteFrames'] as List<RadarFrame>;
+      final rFrames = (rvData['radarFrames'] as List<RadarFrame>?) ?? <RadarFrame>[];
+      final sFrames =
+          (rvData['satelliteFrames'] as List<RadarFrame>?) ?? <RadarFrame>[];
 
       setState(() {
-        _radarHost = rvData['host'] as String;
+        _radarHost = rvData['host']?.toString() ?? 'https://tilecache.rainviewer.com';
         _radarFrames = rFrames;
         _satelliteFrames = sFrames;
         final active = _activeFrames;
@@ -784,6 +830,37 @@ class _WeatherRadarHomeScreenState extends State<WeatherRadarHomeScreen> {
         _errorMessage = e.toString();
         _isLoading = false;
       });
+    }
+  }
+
+  Future<Map<String, dynamic>> _repoSafeRainViewer() async {
+    try {
+      return await _repo.fetchRainViewerFrames();
+    } catch (_) {
+      return {
+        'host': 'https://tilecache.rainviewer.com',
+        'radarFrames': <RadarFrame>[],
+        'satelliteFrames': <RadarFrame>[],
+      };
+    }
+  }
+
+  Future<Map<String, dynamic>> _repoSafeOpenMeteo() async {
+    try {
+      return await _repo.fetchOpenMeteoData(
+        _selectedLocation.coords,
+        _settings.forecastSource,
+      );
+    } catch (_) {
+      // 若指定模型暫時不可用，自動退回預設最佳模型
+      try {
+        return await _repo.fetchOpenMeteoData(
+          _selectedLocation.coords,
+          ForecastModelSource.hkoPlusBest,
+        );
+      } catch (_) {
+        return <String, dynamic>{};
+      }
     }
   }
 
